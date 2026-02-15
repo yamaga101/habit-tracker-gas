@@ -2,7 +2,7 @@
  * Habit Tracker - Google Apps Script
  * Track exercise, alcohol consumption, and weight daily.
  * Features: daily reminders, streak calculation, weekly summary.
- * Version: 1.0.0
+ * Version: 1.1.0
  */
 
 // ============================================================
@@ -177,9 +177,16 @@ function addTodayRow() {
 
 /**
  * Auto-add row at the start of each day (triggered by daily trigger).
+ * Uses LockService to prevent duplicate execution.
  */
 function dailyAutoAddRow() {
-  addTodayRow();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+  try {
+    addTodayRow();
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // ============================================================
@@ -372,8 +379,8 @@ function getWeekStats_() {
   let weights = [];
 
   for (const row of data) {
-    const rowDate = row[COL.DATE - 1];
-    if (!(rowDate instanceof Date)) continue;
+    if (!(row[COL.DATE - 1] instanceof Date)) continue;
+    const rowDate = normalizeDate_(row[COL.DATE - 1]);
     if (rowDate < monday) continue;
 
     const exerciseType = row[COL.EXERCISE_TYPE - 1];
@@ -421,8 +428,8 @@ function getMonthStats_() {
   let totalDays = 0;
 
   for (const row of data) {
-    const rowDate = row[COL.DATE - 1];
-    if (!(rowDate instanceof Date)) continue;
+    if (!(row[COL.DATE - 1] instanceof Date)) continue;
+    const rowDate = normalizeDate_(row[COL.DATE - 1]);
     if (rowDate < thirtyDaysAgo) continue;
 
     totalDays++;
@@ -451,65 +458,84 @@ function getMonthStats_() {
 
 /**
  * Send daily reminder email at 9 PM.
+ * Uses LockService and PropertiesService to prevent duplicates.
  */
 function sendDailyReminder() {
-  const sheet = getTrackingSheet_();
-  const today = Utilities.formatDate(
-    new Date(),
-    Session.getScriptTimeZone(),
-    "yyyy-MM-dd"
-  );
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
 
-  // Check if today's data is already filled
-  const data = sheet.getDataRange().getValues();
-  let todayFilled = false;
+  try {
+    const today = Utilities.formatDate(
+      new Date(),
+      Session.getScriptTimeZone(),
+      "yyyy-MM-dd"
+    );
 
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][COL.DATE - 1] instanceof Date) {
-      const rowDate = Utilities.formatDate(
-        data[i][COL.DATE - 1],
-        Session.getScriptTimeZone(),
-        "yyyy-MM-dd"
-      );
-      if (rowDate === today) {
-        const hasExercise = data[i][COL.EXERCISE_TYPE - 1] !== "";
-        if (hasExercise) {
-          todayFilled = true;
+    // Prevent duplicate emails via PropertiesService
+    const props = PropertiesService.getScriptProperties();
+    const lastReminder = props.getProperty("lastReminderDate");
+    if (lastReminder === today) return;
+
+    const sheet = getTrackingSheet_();
+    const data = sheet.getDataRange().getValues();
+    let todayFilled = false;
+
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][COL.DATE - 1] instanceof Date) {
+        const rowDate = Utilities.formatDate(
+          data[i][COL.DATE - 1],
+          Session.getScriptTimeZone(),
+          "yyyy-MM-dd"
+        );
+        if (rowDate === today) {
+          const hasExercise = data[i][COL.EXERCISE_TYPE - 1] !== "";
+          if (hasExercise) {
+            todayFilled = true;
+          }
+          break;
         }
-        break;
       }
     }
+
+    if (todayFilled) return; // Already recorded
+
+    const exerciseStreak = calculateExerciseStreak();
+    const noAlcoholStreak = calculateNoAlcoholStreak();
+    const ssUrl = SpreadsheetApp.getActiveSpreadsheet().getUrl();
+
+    const subject = "Habit Tracker: Record Today's Habits";
+    const body = [
+      "Today's habits haven't been recorded yet!",
+      "",
+      `Exercise Streak: ${exerciseStreak} days`,
+      `No-Alcohol Streak: ${noAlcoholStreak} days`,
+      "",
+      `Record now: ${ssUrl}`,
+      "",
+      "Keep it up!",
+    ].join("\n");
+
+    MailApp.sendEmail({
+      to: Session.getEffectiveUser().getEmail(),
+      subject: subject,
+      body: body,
+    });
+
+    props.setProperty("lastReminderDate", today);
+  } finally {
+    lock.releaseLock();
   }
-
-  if (todayFilled) return; // Already recorded
-
-  const exerciseStreak = calculateExerciseStreak();
-  const noAlcoholStreak = calculateNoAlcoholStreak();
-  const ssUrl = SpreadsheetApp.getActiveSpreadsheet().getUrl();
-
-  const subject = "Habit Tracker: Record Today's Habits";
-  const body = [
-    "Today's habits haven't been recorded yet!",
-    "",
-    `Exercise Streak: ${exerciseStreak} days`,
-    `No-Alcohol Streak: ${noAlcoholStreak} days`,
-    "",
-    `Record now: ${ssUrl}`,
-    "",
-    "Keep it up!",
-  ].join("\n");
-
-  MailApp.sendEmail({
-    to: Session.getEffectiveUser().getEmail(),
-    subject: subject,
-    body: body,
-  });
 }
 
 /**
  * Send weekly summary email on Monday morning.
+ * Uses LockService to prevent duplicate execution.
  */
 function sendWeeklySummary() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+
+  try {
   const weekStats = getWeekStats_();
   const exerciseStreak = calculateExerciseStreak();
   const noAlcoholStreak = calculateNoAlcoholStreak();
@@ -545,6 +571,9 @@ function sendWeeklySummary() {
 
   // Also update dashboard
   updateDashboard();
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // ============================================================
@@ -600,6 +629,18 @@ function setupTriggers() {
 // ============================================================
 // Utility Functions
 // ============================================================
+
+/**
+ * Normalize a date to midnight for safe comparison.
+ * @param {Date} date
+ * @return {Date} Date with time set to 00:00:00.
+ * @private
+ */
+function normalizeDate_(date) {
+  const normalized = new Date(date);
+  normalized.setHours(0, 0, 0, 0);
+  return normalized;
+}
 
 /**
  * Get the Tracking sheet.
